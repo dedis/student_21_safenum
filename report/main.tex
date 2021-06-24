@@ -1,0 +1,1150 @@
+\documentclass[11pt, a4paper]{article} %\documentclass[11pt, a4paper, twoside, openright]{article} %draft
+
+\usepackage{graphicx,color}
+\usepackage{amssymb, amsmath, array}
+\usepackage{hyperref}
+\usepackage{newpxtext, newpxmath}
+\usepackage{minted}
+\usepackage{xcolor}
+\usepackage{csquotes}
+\usemintedstyle{friendly}
+\usepackage[parfill]{parskip}
+
+\begin{document}
+
+\onecolumn
+
+\input{cover}
+
+
+\thispagestyle{empty}
+
+\newpage
+
+\tableofcontents{\protect\thispagestyle{empty}
+
+\clearpage
+
+\section{Introduction}
+
+With the rise of the internet and widespread
+digital services, the importance of
+secure communication has never been greater.
+Thankfully, after 50 years of Public Key cryptography
+\cite{hellman_overview_1978},
+we have good theoretical tools to provide this security.
+
+Most of these systems rely on modular arithmetic with large numbers.
+For example, RSA \cite{rivest_method_1978},
+or Elliptic Curve cryptography \cite{miller_use_1986}.
+Working with these numbers is not natively supported by hardware.
+Instead, we use a \enquote{Big Number}
+software library to provide this functionality.
+
+Unfortunately, although Public Key cryptosystems have been
+thoroughly
+scrutinized in theory,
+implementations often suffer from vulnerabilities in practice.
+
+One important class of vulnerability are
+timing side-channels
+\cite{kocher_cryptanalysis_1995}.
+This is when an implementation leaks information
+about secret values through its execution time.
+Big Number libraries designed without cryptography in mind
+suffer from these vulnerabilities.
+
+In particular, Go \cite{the_go_authors_go_nodate} provides a general purpose
+Big Number type, \texttt{big.Int},
+which does not provide constant-time operations.
+Unfortunately, this library
+gets used for cryptography
+\cite{ford_proposal_2017}, including inside of Go's own standard library,
+in the \texttt{go/crypto} package.
+
+We've addressed this issue by creating a library
+\cite{meier_cronokirbysafenum_2021}
+providing Big Numbers with constant-time operations.
+Our library provides the necessary operations for Public Key cryptography,
+while avoiding timing side-channels.
+To demonstrate its utility, we've modified Go's \texttt{go/crypto}
+package, replacing the use of \texttt{big.Int} in the DSA and RSA
+systems, achieving a slowdown of only 2x for the latter.
+
+\section{Background}
+
+In this section, we explain how Big Numbers are used in Public Key
+cryptography, what timing side-channels are, how we model their threat,
+as well as what kind of vulnerabilities are present in Go's
+\texttt{big.Int} type.
+
+\subsection{Big Numbers in Cryptography}
+
+Most Public Key cryptosystems rely on
+modular arithmetic.
+
+In RSA \cite{rivest_method_1978}, a public key $(e, N)$ consists
+of a modulus
+$N \in \mathbb{N}$, usually 2048 bits long, and an exponent $e
+\in [0, \varphi(N) - 1]$.
+To encrypt a message $m \in [0, N - 1]$, we calculate
+$$
+c := m^e \mod N
+$$
+
+Since $N$ is much larger than a register, 
+we need a Big Number library to implement this system.
+Modular exponentiation is also not implemented in hardware,
+requiring extra support in software.
+
+DSA
+\cite{technology_digital_1994} also relies on modular arithmetic,
+this time using a large prime $p$ of around 2048 bits, and working
+in the multiplicative group $(\mathbb{Z}/p\mathbb{Z})^*$.
+
+Elliptic Curve Cryptography
+\cite{miller_use_1986} relies on complex formulas for adding points
+on an elliptic curve, built over a finite field $K$. This field
+is usually either a prime field $\mathbb{Z}/p\mathbb{Z}$, in which case arithmetic
+modulo $p$ is used, or a
+binary extension field $\text{GF}(2^n)$, in which case
+binary and polynomial arithmetic are used.
+For prime fields, Big Number functionality is necessary, because
+the size of the prime is greater than 200 bits.
+
+\subsubsection{Implementing Big Numbers}
+
+When a modulus is known in advance, a special purpose
+library implementing arithmetic with this fixed modulus
+can be used. This is the case for Elliptic Curve cryptography,
+where the prime field is a fixed parameter of the system.
+Using a fixed type makes it easier to provide constant-time operation.
+
+A disadvantage is that different systems require different moduli,
+so it takes more work to implement and support each system.
+One way to address this is to automatically generate implementations
+of modular arithmetic, as done by FiatCrypto
+\cite{hvass_high-assurance_nodate}.
+
+In some systems, you need support for dynamic moduli.
+Take RSA, for example.
+In this case, you need a library that provides
+dynamically sized numbers.
+
+\subsubsection{Big Numbers in \texttt{go/crypto}}
+
+Go provides implementations of the Public Key cryptosystems
+we've mentioned so far in its \texttt{go/crypto} package.
+
+Unfortunately \cite{ford_proposal_2017}, the general purpose
+\texttt{big.Int} is used, in part, to implement these systems,
+despite its potential vulnerability to timing attacks.
+
+For DSA \cite{technology_digital_1994}, Go uses \texttt{big.Int}
+for all operations, including key generation, signing, and verification.
+
+For RSA \cite{rivest_method_1978}, Go embeds \texttt{big.Int}
+as part of the API for
+this package. Key generation, encryption, decryption, signing,
+and verification all use \texttt{big.Int}.
+
+For ECC \cite{miller_use_1986}, Go defines a general interface
+for Elliptic Curves, requiring operations like point addition,
+scalar multiplication, etc. All of these are defined in terms
+of \texttt{big.Int}. Only \texttt{P384}
+uses \texttt{big.Int} for field arithmetic directly. The other
+curves instead convert \texttt{big.Int} to an internal
+type for their field elements,
+and perform their operations using that type instead. 
+These internal types vary a lot between these curves.
+\texttt{P224} uses hand-written operations in pure Go
+for its field,
+\texttt{P256} uses an optimized implementation in assembly,
+and \texttt{P521} uses field arithmetic generated
+by FiatCrypto
+\cite{hvass_high-assurance_nodate}.
+
+\subsection{Timing Attacks}
+
+A side-channel
+\cite{kelsey_side_1998}
+leaks secret information indirectly,
+through the observable effects of a program's execution.
+Timing side-channels use the execution time of a program
+to infer information about secret data it handles. 
+A timing attack is the use of a timing side-channel to break the security
+of some program or cryptographic algorithm.
+
+When a program takes a different number of steps based on the value of some
+secret, this is an obvious timing side-channel.
+For example, a naive algorithm for comparing inputs with a secret password
+might stop as soon as a mismatch is found. This algorithm has
+an inherent timing side-channel. This can be exploited,
+allowing the secret password to be guessed byte-by-byte.
+
+Not all timing side-channels are this simple. Algorithms
+that always take the same number of steps
+can still having timing side-channels because of the underlying
+hardware. For example, a processor may
+execute an operation faster for some inputs, or the presence of a cache
+could be used to infer what addresses are being accessed. These
+microarchitectural timing side-channels are also of concern.
+See \cite{ge_survey_2018} for a survey of these vulnerabilities.
+
+\subsubsection{Actual Attacks}
+
+Although the presence of a side-channel
+does not directly lead to attacks,
+Paul Kocher
+demonstrated the potential for timing side-channels to break
+crypto-systems as early as 1995
+\cite{kocher_cryptanalysis_1995, kocher_timing_1996}.
+These attacks relied on algorithms that perform a varying number of
+operations based on secret data. 
+
+One objection to timing attacks is that
+while a timing side-channel is catastrophic in theory, in practice
+this channel is too noisy to exploit. Unfortunately,
+it's possible to exploit these attacks, even across
+a network \cite{brumley_remote_2005, brumley_remote_2011}.
+Noise only makes the channel more difficult to exploit,
+requiring more samples to detect the underlying signal.
+
+The use of caches as a potential side-channel was
+identified early on as well \cite{page_theoretical_2002}.
+Accessing data takes longer when that data is outside
+of the cache.
+If data accesses depend on a secret value, the observed execution
+time will also depend on this value. Additionally,
+an attacker located on the same machine
+can place data into the cache and probe it themselves,
+learning more precise information about the
+program's access patterns. This kind of colocation is increasingly common,
+as more applications are run on cloud servers.
+
+A wide variety of attacks involving caches have been mounted
+against various cryptosystems
+\cite{
+  bernstein_cache-timing_2005,
+  yarom_cachebleed_2017,
+  cabrera_aldaya_cache-timing_2019}
+: accessing data based on secret values should
+be avoided in cryptographic code.
+
+\subsubsection{Our Threat-Model}
+\label{threat_model}
+
+These side-channels can be distilled into a simple,
+albeit pessimistic, set of rules:
+
+\begin{enumerate}
+  \item Any loop leaks the number of iterations taken.
+  \item Any memory access leaks the address accessed.
+  \begin{enumerate}
+    \item As a consequence, accessing an array leaks the index accessed.
+  \end{enumerate}
+  \item Any conditional statement leaks which branch was taken.
+\end{enumerate}
+
+Rule 1 is justified by theoretical concerns: a longer loop
+uses more operations. In practice, it's difficult to observe
+the iterations of each loop in a program from a global timing signal,
+making this a pessimistic rule.
+
+Rule 2 is justified by various cache based side-channels and attacks
+\cite{
+  bernstein_cache-timing_2005,
+  yarom_cachebleed_2017,
+  cabrera_aldaya_cache-timing_2019}.
+Since caches only load information an entire line at a time,
+this rule may seem too pessimistic. Perhaps only which cache line
+was accessed should be kept secret \cite{brickell_technologies_2011}.
+Unfortunately, it's possible to perform
+attacks on a much finer level
+\cite{
+  bernstein_word_2013,
+  osvik_cache_2006,
+  yarom_cachebleed_2017}.
+This is why we take a pessimistic position, and assume
+that accesses leak their exact address.
+
+
+Rule 3 is justified in two ways. First, if different branches of a conditional
+statement execute a different number of operations,
+we can inherently observe which branch was taken. Second, even if both
+branches execute identitical operations, the CPU's branch predictor
+can be exploited to leak information about which branch was taken
+\cite{
+  aciicmez_predicting_2006,
+  aciicmez_power_2007,
+  evtyushkin_jump_2016}.
+
+In addition to these rules,
+we need a basic set of trusted operations to build our programs.
+We assume that addition, multiplication,
+logical operations, and shifts, as implemented in hardware,
+are constant-time in their inputs.
+This is the case on most processors, one notable exception being
+microprocessors
+\cite{pornin_bearssl_nodate}. This assumption is reasonable
+for the platforms targeted by Go and our library.
+
+\subsection{Vulnerabilities in \texttt{big.Int}}
+
+Go provides a general purpose type for Big Numbers: \texttt{big.Int}.
+This type focuses on being optimized, and useful in various
+situations. It does not focus on protecting against timing side-channels.
+Unfortunately, out of convenience,
+and for lack of better alternatives, it gets used in
+cryptography, even inside of Go's standard library.
+
+In this section, we look at some of the important implementation aspects
+of \texttt{big.Int}, and how they might be vulnerable
+according to our threat model.
+
+\subsubsection{Padding}
+
+The \texttt{big.Int} type normalizes numbers internally,
+removing any leading zero limbs. Even if you initialize a number
+using bytes zero-padded to a certain length, the resulting value
+will immediately chop off these zeros.
+By discarding them, operations on
+this number will have fewer limbs to process, and will be faster.
+
+Unfortunately, this means that \texttt{big.Int} pervasively leaks information
+about the padding of numbers. Operations
+take more time when a number has more limbs,
+thus leaking the padding of numbers.
+This has been exploited
+in OpenSSL \cite{merget_raccoon_2019}, and might potentially
+be a vulnerability in Go's cryptography library.
+
+\subsubsection{Leaky Algorithms}
+
+Because \texttt{big.Int} is not written with cryptography in mind,
+its operations violate the rules in
+\ref{threat_model}. Many methods take a different number of iterations
+, branch conditionally, or
+access memory differently
+depending on their values. Because \texttt{big.Int}
+is designed for general purpose use, this problem should only get worse
+as the library is further developed and optimized.
+
+Ultimately, the problem is not the existence of \texttt{big.Int},
+but its use in Go's cryptography library, and in the broader ecosystem.
+
+\subsubsection{Mitigations}
+
+Although \texttt{big.Int} gets used in Go's cryptography library,
+the authors are aware of its shortcomings, and have implemented
+several mitigations to try and make its timing side-channels harder to
+exploit.
+
+One of the most important ones is a mitigation
+for RSA: blinding \cite{kocher_timing_1996}.
+
+To decrypt a ciphertext
+$c = m^e \mod N$, we would normally calculate:
+
+$$
+c^d \mod N
+$$
+
+with $d$ our private key, and $(e, N)$ our public key.
+When exponentiation is not implemented in a constant-time way, like
+with \texttt{big.Int}, this process can leak information about $m$.
+If an adversary can choose $c$, then this can leak information about
+$d$ as well.
+
+To mitigate this, instead of decrypting $c$ directly,
+we first generate a random integer
+$r \in (\mathbb{Z}/N\mathbb{Z})^*$. Then, we decrypt $r^e \cdot c$.
+This gives us the value $r \cdot m$, and we can recover
+$m$ by multiplying by $r^{-1}$.
+
+While this effectively mitigates the simplest attacks
+against exponentiation, a very leaky operation,
+other methods are left unprotected, and may
+have subtle exploits. For
+example, we there are fundamental issues with
+padding, which has lead to attacks
+in OpenSSL \cite{merget_raccoon_2019}.
+
+\section{Implementation}
+
+We've implemented a library, called
+\texttt{safenum} \cite{meier_cronokirbysafenum_2021}, intended to provide
+a replacement for \texttt{big.Int}, suitable for cryptography.
+To test its utility, we've replaced some
+of \texttt{go/crypto}'s usage of \texttt{big.Int} with our own library,
+in a separate repository
+\cite{meier_cronokirbyctcrypto_2021}.
+
+In this section, we go over the design and implementation of our
+library.
+
+\subsection{The \texttt{safenum} library}
+
+Safenum defines a \texttt{Nat} type, intended to
+replace \texttt{big.Int}. This type represents arbitrary
+numbers in $\mathbb{N}$. Unlike \texttt{big.Int}, we do not handle
+negative numbers. Handling a sign bit in constant-time is exceedingly
+tricky. Thankfully, we haven't found this limitation to be restrictive
+when replacing \texttt{big.Int} in Go's cryptography library.
+
+We represent numbers in base $W := 2^{64}$. Concretely, we
+store a number as a slice of type \texttt{[]uint}, in little
+endian order. We call these the \enquote{limbs} of a number. For example,
+the slice:
+\begin{minted}{Go}
+[]uint{13, 47, 52}
+\end{minted}
+represents the number:
+$$
+52 \cdot 2^{128} + 47 \cdot 2^{64} + 13
+$$
+These limbs might be padded, to conceal the true value of a number,
+as we'll see later.
+
+We provide operations for addition and multiplication of \texttt{Nats}.
+We also provide numerous operations
+for modular arithmetic, including modular addition, subtraction,
+multiplication, exponentiation, inversion, reduction, and taking
+square roots modulo prime numbers. We also provide operations
+for serializing to and from bytes, as well as converting
+to and from \texttt{big.Int}.
+
+We try to structure the API in a similar way to \texttt{big.Int},
+where an operation is performed on a separate
+\texttt{Nat} receiving the result.
+For example, this is the signature for
+modular addition:
+
+\begin{minted}{Go}
+func (z *Nat) ModAdd(x *Nat, y *Nat, m *Modulus) *Nat
+\end{minted}
+
+This calculates $z \leftarrow x + y \mod m$, returning $z$. The advantage
+of structuring the API this way, instead of simply returning a new
+value, is that we can reuse the memory of $z$ for the result.
+
+We go one step further, in fact, and use the memory of the receiving
+\texttt{Nat} for all scratch space needed inside of an operation.
+Structuring our operations this way limits memory waste.
+
+\subsubsection{Handling Size}
+
+A \texttt{big.Int} always stores a value using as few limbs
+as possible. Its \textit{true size}, the number of limbs
+necessary to store a value, always matches its \textit{announced size},
+the number of limbs actually stored. When creating
+a \texttt{big.Int}, any padding is immediately stripped away,
+to satisfy this invariant.
+
+For \texttt{Nat} however, we allow values to be padded.
+This means that the announced size of a number
+can be larger than its true size. Because the announced size
+is what actually affects the runtime of our operations,
+we can make sure that this size depends only on public information,
+allowing us to keep the true size secret.
+
+This means that every result we produce needs a clear
+announced size. For modular
+operations, we have an obvious choice: the size of the modulus.
+When doing a modular operation, the result will always receive
+the same announced size as the modulus.
+
+For example, when doing modular addition:
+
+\begin{minted}{Go}
+func (z *Nat) ModAdd(x *Nat, y *Nat, m *Modulus) *Nat
+\end{minted}
+
+our result \texttt{z} will have the same announced size as \texttt{m}.
+This implies that the true size of \texttt{z} is at most that
+of \texttt{m}.
+After modular addition, we know that $z \in [0, m - 1]$,
+so this fact about the true size of \texttt{z} does
+not reveal anything new.
+
+When serializing a \texttt{Nat}, we respect its announced size,
+and produce zeros for padding as necessary. This is done without
+any special handling, since extra zeros are already stored
+to match our announced size.
+
+Similarly, when deserializing a \texttt{Nat} from bytes,
+we respect any padding, unlike \texttt{big.Int}. For example,
+if 32 big endian bytes are deserialized, we will end up
+with a \texttt{Nat} with an announced size of 256 bits, regardless
+of the value of those bytes.
+
+This leaves us with non-modular addition and multiplication of numbers.
+One approach is to use whatever size necessary to store
+a maximal result.
+For example, if we multiply
+numbers $x_1$ and $x_2$, of announced sizes $b_1$ and $b_2$, then
+our result will need a size of at most $b_1 + b_2$.
+
+The disadvantage is that we use more and more space for each
+operation, and we're unable to shrink the announced size,
+even when we know that our result would fit.
+Because of this, we opt towards letting users specify exactly how many
+resulting bits they need in the output. For example,
+multiplication has the following signature:
+
+\begin{minted}{Go}
+func (z *Nat) Mul(x *Nat, y *Nat, cap uint) *Nat
+\end{minted}
+
+Here \texttt{cap} is the number of bits that the result should have.
+We use this to determine the result's announced length. Any output
+beyond that capacity will simply be discarded.
+
+In summary, the announced size of a \texttt{Nat} is always
+clear based on how it's produced.
+This size comes from deserializing
+a value, from matching the size of a modulus, or from manually
+deciding on an output size.
+
+\subsubsection{Moduli}
+
+In our library, we use a different type for
+the moduli used in modular arithmetic: \texttt{Modulus}. There are several
+reasons for doing this.
+
+First, some modular operations use certain properties
+of the modulus which can be pre-computed. For example, montgomery multiplication
+uses $m^{-1} \mod W$, with $W$ our base.
+Using a separate type for moduli lets us avoid
+recomputing these properties, by storing them alongside
+the value of our modulus.
+
+Second, we allow the true size of a modulus to be leaked.
+Moduli are stored \emph{without} padding.
+This is desirable because modular reduction needs access to the most
+significant bits of a modulus, and fetching this information without
+leaking padding is exceedingly difficult. Furthermore,
+by storing moduli without padding, the announced size of numbers produced
+through modular operations is as tight as possible, making
+every operation faster.
+
+This assumption is safe in cryptography. Moduli are often public,
+like with the public modulus $N$ in RSA. Since the exact value
+is known, leaking the true size is fine.
+There
+are other cases where a private modulus is necessary.
+Even then, the true size of that modulus remains known. For example,
+when generating an RSA key, we know the factorization $N = pq$ of the modulus,
+and calculate our private key modulo $\varphi(N) = (p - 1)(q - 1)$:
+
+$$
+d := e^{-1} \mod \varphi(N)
+$$
+
+Leaking the value of $\varphi(N)$ would be catastrophic. On the other hand,
+it's clear that the true size of $\varphi(N)$ is approximately
+that of $N$, which is known. In this case, leaking the true size of
+$\varphi(N)$ is fine.
+
+Finally, moduli are also allowed to leak whether or not
+they are even. The motivation behind this is that certain modular
+operations have faster variants for odd moduli, or require
+different algorithms to support even moduli. Rather than
+providing different methods for these different cases, we choose
+to select the correct variant internally, allowing all modular
+operations to work without exception. This requires
+checking whether or not a modulus is odd or even, in order
+to dispatch the right operation, leaking this bit of
+information in the process.
+
+Fortunately, we're not
+aware of any realistic situation where the evennness of a
+modulus needs to be kept secret. In fact, for the cryptographic
+algorithms we know of, the evenness of a modulus 
+is known statically, making this check fine.
+In RSA, for example, the modulus $N$ is odd by construction, and
+$\varphi(N)$ is even as a consequence.
+
+Since moduli are stored without padding, we require a separate
+type to not violate \texttt{Nat}'s contract around size.
+\texttt{Nat} also has stronger constraints on information leakage,
+so providing a separate type helps to avoid accidentally
+violating them.
+
+\subsection{Constant-Time Operations}
+
+The rules we established in our threat model \ref{threat_model}
+are quite stringent. For most operations, we need to have conditional
+behavior depending on the values we process. Without access
+to branching, this seems difficult.
+Thankfully, we can emulate branching
+without leaking information.
+The idea is simple: to choose between two branches, we perform both,
+and then combine
+the results together, without revealing
+which result is produced.
+
+For example, a standard algorithm for modular subtraction would look
+like this (in pseudo-Go):
+
+\begin{minted}{Go}
+func (z *Nat) ModSub(x *Nat, y *Nat, m *Modulus) *Nat {
+  borrow := z.Sub(x, y)
+  if borrow == 1 {
+    z.Add(z, m)
+  }
+}
+\end{minted}
+
+The problem is that by conditionally adding in $m$, we reveal
+whether or not $y > x$, and a borrow occurred. Our solution
+uses a new primitive:
+
+\begin{minted}{Go}
+func (z *Nat) ctCondCopy(v choice, y *Nat) *Nat
+\end{minted}
+
+This function assigns \texttt{y} to \texttt{z} if
+\texttt{v == 1}, and does nothing otherwise.
+Furthermore, this primitive should leak no information about
+the condition.
+
+With this in place, we can implement modular subtraction without leakage:
+
+\begin{minted}{Go}
+func (z *Nat) ModSub(x *Nat, y *Nat, m *Modulus) *Nat {
+  borrow := z.Sub(x, y)
+  scratch := new(Nat).Add(z, m)
+  z.ctCondCopy(choice(borrow), scratch)
+}
+\end{minted}
+
+We always perform the addition, and copy over the result if necessary,
+without leaking the value of \texttt{borrow}.
+
+This pattern is what allows us to replace
+branching with constant-time operations throughout
+our algorithms.
+
+\subsubsection{Building Primitives}
+
+How do you make primitives like
+\texttt{ctCondCopy}, which let you choose results without
+leaking which choice was made?
+
+The methods for constant-time choice are analogous to
+those used for variable-time choice. Instead of using
+\texttt{bool} to represent the result of a condition, we use
+
+\begin{minted}{Go}
+type choice Word
+\end{minted}
+
+The value of a choice is either \texttt{1} or \texttt{0},
+but we use the same
+type as full limbs, to avoid having the compiler
+re-insert branches into our code.
+
+From this choice value, we can build a primitive that selects
+between two limbs, without leaking which choice was selected:
+
+\begin{minted}{Go}
+func ctIfElse(v choice, x, y Word) Word {
+  mask := -Word(v)
+  return y ^ (mask & (y ^ x))
+} 
+\end{minted}
+
+This routine returns \texttt{x} if
+\texttt{v == 1}, and \texttt{y} otherwise.
+The bitwise operations don't leak information about
+our choice, unlike a conditional statement.
+
+If \texttt{v == 0}, then \texttt{mask} contains only zeros, and we're left
+with \texttt{y}. When \texttt{v == 1},
+then \texttt{mask} only contains ones. The \texttt{y}s cancel each
+other out,
+leaving us with \texttt{x}.
+
+We can use this primitive to build up a larger selection primitive,
+allowing us to conditionally
+assign an entire slice of limbs to another:
+
+\begin{minted}{Go}
+func ctCondCopy(v choice, x, y []Word) {
+  for i := 0; i < len(x); i++ {
+    x[i] = ctIfElse(v, y[i], x[i])
+  }
+}
+\end{minted}
+
+These primitives allow us to use \texttt{choice} to introduce conditional
+behavior without leaking our choices, but we also need
+a way to
+create \texttt{choice} values. These are built up
+in a similar way, from small functions to larger ones.
+
+We can decide whether or not two limbs are equal using some bitwise
+trickery:
+
+\begin{minted}{Go}
+func ctEq(x, y Word) choice {
+  q := uint64(x ^ y)
+  return 1 ^ choice((q|-q)>>63)
+}
+\end{minted}
+
+To understand why this trick works, first realize that in two's complement,
+if you take any number $x \neq 0$,
+then the most significant bit of either $x$ or $-x$ is set.
+For $0$, neither are set.
+We can check that \texttt{q} is non-zero by seeing
+if either bit is set:
+\begin{minted}{Go}
+choice((q|-q)>>63)
+\end{minted}
+Since \texttt{q} is zero precisely when \texttt{x} and \texttt{y}
+are equal, we negate this non-zero check.
+
+We can use this primitive to compare entire slices of limbs
+in constant time:
+
+\begin{minted}[samepage]{Go}
+func cmpEq(x []Word, y []Word) choice {
+  res := choice(1)
+  for i := 0; i < len(x) && i < len(y); i++ {
+    res &= ctEq(x[i], y[i])
+  }
+  return res
+}
+\end{minted}
+
+Two slices are equal when each of their limbs match.
+Since we can't exit early without leaking information
+about \texttt{x} and \texttt{y}, we implement this formula
+using bitwise operators, without any short-circuiting.
+
+\subsection{Algorithm Choices}
+
+While going over how each operation works in detail is outside
+the scope of this report, describing some the high-level
+techniques used for these operations is still valuable.
+
+Many of these operations were inspired by the excellent
+work of Thomas Pornin in BearSSL
+\cite{pornin_bearssl_2020-1}.
+
+\subsubsection{Modular Reduction}
+
+To reduce a number modulo $m$, we first implement an operation
+that allows us to shift in a single limb. This
+lets us reduce a number
+of the form:
+$$
+z := a \cdot W + b
+$$
+with $a \in [0, m - 1]$ and $b \in [0, W - 1]$. We can use
+this operation to reduce an arbitrary $x$. First, we can
+write out
+$x$ in base $W$:
+$$
+x = x_n W^n + x_{n -1}W^{n - 1} + \cdots + x_0
+$$
+Then, we can rewrite this expression to see how
+shifting plays a role:
+$$
+x = ((x_n W + x_{n - 1})W + \cdots)W + x_0
+$$
+Having written $x$ in this form, it becomes clear that to reduce
+$x$ modulo $m$, we can use our shifting primitive, folding
+in the limbs of $x$ from most significant to least significant.
+
+Implementing the shifting operation needs
+the quotient $q := \lfloor z / m \rfloor$,
+in order to calculate the remainder $z - q m$.
+Instead of calculating $q$ directly, we instead
+produce an estimate $\hat{q}$, by using the most significant
+$64$ bits of $m$ to divide $128$ corresponding bits of $z$.
+This estimate satisfies $\hat{q} = q \pm 1$, so we then
+conditionally add and subtract $m$ to correct
+for this error.
+This technique is further described in \cite{pornin_bearssl_2020-1}.
+
+\subsubsection{Inversion}
+
+For modular inversion, which method we use depends on whether
+our modulus is odd or even. As mentioned previously,
+we're allowed to choose the right method dynamically.
+
+For odd moduli, we use
+the binary GCD algorithm, as described in \cite{pornin_optimized_2020}.
+We have yet to implement the most optimized version, which accumulates
+intermediate results into single limb registers. Instead, we
+perform full width operations at each iteration.
+
+For an even modulus $m$,
+there's a standard trick to calculate $x^{-1} \mod m$.
+First, we calculate
+$u := m^{-1} \mod x$,
+using our method for odd moduli,
+and then we calculate our desired inverse as:
+
+$$
+\frac{um - 1}{x}
+$$
+
+This requires implementing a division operation that works
+with padded numbers. We can't reuse the
+limb-by-limb modular reduction
+routine we normally use, and instead adapt
+a bit-by-bit reduction routine, as described in
+\cite{pornin_bearssl_2020-1}.
+
+\subsubsection{Exponentiation}
+
+For exponentiation, we use left-to-right exponentiation,
+with a window size of 4 bits. To perform window lookups,
+we use a constant-time conditional assignment
+over each of the possible window values. Even though this requires traversing
+the entire window table at every iteration, we've found that this method
+is still faster than using a smaller window size of 2 bits.
+
+\subsubsection{Multiplication}
+
+For modular multiplication, we calculate the full product
+$ab$, and then reduce this result modulo $m$. This works
+for both odd and even moduli.
+
+In the case of odd moduli, using Montgomery multiplication
+\cite{kaya_koc_analyzing_1996-1, pornin_bearssl_2020-1} is
+faster, but requires converting inputs into their Montgomery
+representation, producing outputs in this representation.
+For exponentiation,
+the cost of converting to and from this representation is amortized,
+since we do many multiplications between conversions, making
+it considerably faster to use this technique. Unfortunately,
+Montgomery multiplication doesn't work for even moduli,
+so exponentiation is slower in that case.
+
+\subsubsection{Modular Square Roots}
+
+To calculate $\sqrt{z} \mod p$, we assume that $p$ is prime.
+Calculating square roots with a composite modulus is,
+in general, as hard
+as factoring it \cite{buhler_basic_2008}, which is why
+we only support prime moduli.
+Which algorithm we use depends on whether $p = 3 \mod 4$,
+or $p = 1 \mod 4$.
+
+In the first case, we can calculate a root as:
+$$
+\sqrt{z} = z^{(p + 1) / 4} \mod p
+$$
+
+In the second case, we use a constant-time variant
+of the Tonnelli-Shanks algorithm, as described in 
+\cite{wahby_hashing_nodate}.
+
+\subsection{Implementation Choices}
+
+In this section, we describe a few more details
+about how numbers are stored, and the motivation behind
+these choices.
+
+\subsubsection{Saturated or Unsatured Limbs}
+
+We store numbers in base
+$W := 2^{64}$. This means that we use the full width of a register
+to store each limb. Because of this, we say that are limbs
+are \textit{saturated}. It's also possible to store
+limbs \textit{unsaturated}, by using fewer than $64$ bits.
+BearSSL 
+\cite{pornin_bearssl_2020-1}
+takes this approach, using only $31$ bits of the available $32$ bits
+in the integers it uses. For $64$ bit registers, using $63$ bit unsaturated
+limbs would be the analogous choice.
+
+There are two compelling reasons for using unsaturated limbs.
+
+First, this leaves an extra bit of space to hold a carry
+or borrow after an addition or subtraction. This allows
+us to chain together carries to implement operations over multiple
+limbs, without having to use assembly instructions. In Go,
+this isn't a concern, since \texttt{bits.Add} and
+\texttt{bits.Sub} can be used to implement these intrinsics
+in a cross-platform way.
+
+Second, if we use $w$ bits for each limb, then montgomery
+multiplication needs to work with a value of size $2w + 1$ bits. With a fully
+saturated limb of $64$ bits, we need $129$ bits. This uses
+an extra register compared to unsaturated limbs of $63$ bits. Because
+montgomery multiplication is called very often during exponentiation,
+this can yield considerable savings.
+
+One disadvantage of using unsaturated limbs comes when converting
+numbers to and from bytes. With fully saturated limbs, our
+$64$ bit limbs are composed of exactly $8$ bytes. With $63$ bit limbs,
+this isn't the case, making conversion more
+complicated and expensive.
+
+Using unsaturated limbs would
+also require storing additional information about the exact
+announced size of a number, instead of being able to use
+the number of limbs directly, as we do now.
+
+Finally, by using saturated limbs, we can use the assembly routines
+already implemented for low level operations
+in \texttt{big.Int}, which uses saturated limbs. These low-level
+routines are constant-time, and speed up basic operations.
+
+Interoperability with these routines
+is ultimately the main reason why we opted
+for using saturated limbs.
+
+\subsubsection{Redundant Reductions}
+
+Our library tries to prevent misuse. Because of this,
+modular operations work even if their inputs are not already
+reduced. For example, addition modulo $m$ should return the
+right result, even if the inputs are greater than $m$.
+Unfortunately, the cost of reducing inputs modulo $m$ when
+they are already in range is not desirable, since this operation
+is relatively expensive. Ideally, we'd like to avoid reducing
+inputs when we know this reduction
+is redundant.
+
+To implement this, each \texttt{Nat} stores a pointer to a modulus,
+indicating that it has been reduced by this modulus.
+When we reduce a number modulo $m$, we check this pointer,
+and skip the reduction if it matches $m$. If we modify
+the value of a number, we update the modulus it points to
+accordingly.
+For example:
+\begin{minted}{Go}
+z.ModAdd(x, y, m)
+\end{minted}
+will set \texttt{z}'s modulus to \texttt{m}, and calling:
+\begin{minted}{Go}
+z.SetBytes(data)
+\end{minted}
+will clear \texttt{z}'s modulus, making it \texttt{nil}.
+
+We modify this pointer based strictly on what methods are called,
+never on the actual value of a result. Thus, the dynamic
+checks of this pointer
+only depend on the call-graph of our program.
+Since this graph is statically determined, these redundant reduction
+checks don't impact the constant-time properties of our library.
+
+\section{Results}
+
+We've compared the performance of our library
+with \texttt{big.Int}, operation by operation, as well as in the
+context of the \texttt{go/crypto} package.
+Overall, our library is about 2.6x slower than using
+\texttt{big.Int} for most operations,
+but only 2x slower in realistic situations.
+In this section, we
+present these results in detail.
+
+\subsection{Comparison with \texttt{big.Int}}
+
+We've set up a series of benchmarks to compare the performance
+of \texttt{Nat} compared to \texttt{big.Int} on various operations.
+
+The following operations are all implemented on values, exponents,
+and (odd) moduli of 2048 bits. For raw addition and multiplication,
+we use the full size necessary to represent the result in our benchmarks.
+
+\begin{center}
+ \begin{tabular}{|c | c | c | c|} 
+ \hline
+ Operation & op / s (\texttt{big.Int}) & op / s (\texttt{Nat}) & ratio \\ [0.5ex] 
+ \hline\hline
+ Addition & 10,980,842 & 12,164,599 & 0.90 \\
+ \hline
+ Modular Addition & 6,986,739 & 3,075,188 & 2.27 \\
+ \hline
+ Multiplication & 1,316,322 & 542,385 & 2.43 \\
+ \hline
+ Modular Reduction & 454,917 & 63,253 & 7.19 \\
+ \hline
+ Modular Multiplication & 1,000,000 & 44,596 & 22.42 \\
+ \hline
+ Modular Inversion & 1,000,000 & 621 & 1610 \\
+ \hline
+ Modular Exponentiation & 223 & 86 & 2.59 \\
+ \hline
+\end{tabular}
+\end{center}
+
+The most expensive operation, by far, is exponentiation. Because
+of this, it's fair to compare the performance on these two types
+mainly on this operation. We can see that \texttt{Nat} is 2.6x slower
+compared to \texttt{big.Int} for exponentiation, although
+some operations are much slower.
+
+For comparing modular square roots, we used the primes
+$p_3 = 2^{244} + 79$, which is $3 \mod 4$,
+and $p_1 = 2^{244} + 153$ which is $1 \mod 4$. We use different primes
+to test the various codepaths for modular square roots:
+
+\begin{center}
+ \begin{tabular}{|c | c | c | c|} 
+ \hline
+ Operation & op / s (\texttt{big.Int}) & op / s (\texttt{Nat}) & ratio \\ [0.5ex] 
+ \hline\hline
+ $\sqrt{z} \mod p_3$ & 40,464 & 26,886 & 1.50 \\
+ \hline
+ $\sqrt{z} \mod p_1$ & - & 7,867 & - \\
+ \hline
+\end{tabular}
+\end{center}
+
+We couldn't find a large value where Go's Tonneli Shanks routine
+managed to find a square root without hanging, although we
+expect the ratio to be similar to the other case.
+
+\subsection{Comparison with \texttt{go/crypto}}
+
+We've created a forked package
+\cite{meier_cronokirbyctcrypto_2021}
+of \texttt{go/crypto}, where we've replaced \texttt{big.Int}
+with our own \texttt{Nat} type for both RSA and DSA. All of the code
+using \texttt{big.Int} has been replaced, with the exception of
+primality checking. This demonstrates the utility of
+our package for writing cryptographic code.
+
+We've also run benchmarks to assess the performance impact, as we
+show in the following table:
+
+\begin{center}
+ \begin{tabular}{|c | c | c | c|} 
+ \hline
+ Operation & op / s (\texttt{big.Int}) & op / s (\texttt{Nat}) & ratio \\ [0.5ex] 
+ \hline\hline
+ RSA Decrypt & 670 & 312 & 2.15 \\
+ \hline
+ RSA Sign & 675 & 372 & 1.81 \\
+ \hline
+ RSA Decrypt (3 Prime) & 1173 & 596 & 1.97 \\
+ \hline
+ DSA Sign & 6202 & 2625 & 2.36 \\
+ \hline
+ DSA Parameters & 0.89 & 1.64 & 0.54 \\
+ \hline
+\end{tabular}
+\end{center}
+
+We use a 2048 bit modulus for both RSA and DSA. For RSA, we use
+the CRT optimization, instead of using exponentiation directly.
+Our benchmarks for \texttt{big.Int} use blinding, but our benchmarks
+for \texttt{Nat} do not. Because \texttt{Nat} is constant-time,
+we don't need to use blinding to mitigate timing attacks.
+We don't include DSA verification, since this can be safely done
+with \texttt{big.Int}.
+
+Overall, we can see that in a real world scenario, the use
+of \texttt{Nat} is only 2x slower. This can surely be improved,
+but is already an encouraging result.
+
+\section{Further Work}
+
+While we're happy with the utility of our library,
+and the performance results we've managed to achieve, it's
+of course still possible to improve on this front.
+
+\subsection{Verifying Constant-Time Properties}
+
+Ultimately, we would like to have more assurance about the
+constant-time properties of our library. Our code hasn't
+undergone an audit, nor have we verified the assembly output
+produced by the Go compiler to ensure that it meets our demands.
+
+Ideally, it would be nice to incorporate some kind of automated
+analysis of our code to detect timing side-channels. An approach
+similar to dudect
+\cite{reparaz_dude_2017} 
+might be an interesting way to provide a form of fuzz testing
+to detect unwanted time-variation.
+
+\subsection{Optimizing Assembly Routines}
+
+Currently, we rely on some assembly routines pulled from
+\texttt{big.Int}, slightly modified to avoid jumping to variable-time
+routines. Unfortunately, not all of the primitive operations we would
+like to have are present. Furthermore, we could reduce memory usage
+in some places, by having these operations present a "conditional"
+variant. For example, we could have an add operation taking a
+\texttt{choice} flag, allowing us to choose whether or not to perform
+an addition, without leaking information. This would avoid having
+to use a scratch buffer and a conditional copy.
+
+To gain similar speed to the other primitives, these new primitives
+would also need to be implemented in assembly. This would be time-consuming,
+but likely worth the effort. There are also new solutions
+to help with writing assembly routines in Go, such as the Avo library
+\cite{mcloughlin_mmcloughlinavo_2021}.
+
+\subsection{Upstreaming to \texttt{go/crypto}}
+
+While we hope our library is immediately useful for the broader
+ecosystem, it's not realistically going to be replacing
+\texttt{big.Int} in Go's cryptography library any time soon.
+
+The most likely path towards removing \texttt{big.Int} from
+\texttt{go/crypto} is to move towards specialized arithmetic
+implementations for each prime field involved in ECC. DSA is a legacy
+algorithm, where the security flaws introduced
+by \texttt{big.Int} are not of major concern.
+
+This leaves RSA. Unfortunately, because RSA requires dynamic
+moduli, we need a Big Number library of some kind.
+Ideally, this library would be internal to RSA, allowing constant-time
+operation, and severing the bridge between Go's cryptography
+package, and \texttt{big.Int}.
+
+We've
+submitted a patch \footnote{\url{https://go-review.googlesource.com/c/go/+/326012}}
+for Go's implementation of RSA,
+replacing \texttt{big.Int} with an internal number
+type,
+using the minimal amount of code
+necessary to implement encryption and decryption.
+The public API, as well as key generation,
+still use \texttt{big.Int}.
+
+Using unsaturated limbs, we've found that our version of RSA
+suffers only a 1.7x slowdown, while implementing encryption and
+decryption in constant-time.
+
+\section{Conclusion}
+
+In summary, we have shown
+why Go's general purpose big number type, \texttt{big.Int},
+is not suitable for Cryptography.
+Unfortunately, this type gets used out of convenience,
+and for lack of better alternatives,
+even in Go's own cryptography library.
+
+To address this, we've created a replacement library for \texttt{big.Int},
+achieving a slowdown of only 2.6x for most operations, while attempting
+to provide constant-time operation.
+
+To test the utility of this library, we've replaced the usage
+of \texttt{big.Int} in Go's implementation of RSA, and DSA, and found
+only a slowdown of 2x.
+
+\section*{Acknowledgements}
+
+Firstly, I'd like to thank Professor Bryan Ford for supervising this work.
+I'd like to thank Pierluca Borsò as well, for letting me 
+work on this project.
+Finally, I'd also like to thank Daniel Huigens, and Marin Thiercelin,
+from ProtonMail, for their advice and industry perspective on this work.
+
+\addcontentsline{toc}{section}{Acknowledgements}
+
+\bibliographystyle{plainurl}
+\bibliography{references}
+\end{document}
